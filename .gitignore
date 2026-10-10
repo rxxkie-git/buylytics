@@ -1,0 +1,78 @@
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Node / Frontend
+# =========================
+node_modules/
+.next/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# =========================
+# Python / Backend
+# =========================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Backend-specific
+backend/.env
+backend/.venv/
+backend/venv/
+backend/env/
+backend/__pycache__/
+backend/**/*.pyc
+backend/preprocessing_outputs/
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Local databases
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Docker / local service data
+# =========================
+docker-data/
+kafka-data/
+redis-data/
+postgres-data/
+
+# =========================
+# OS
+# =========================
+.DS_Store
+
+# =========================
+# IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.temp
+
+# =========================
+# Local/test generated datasets
+# =========================
+first_100_rows.xlsx

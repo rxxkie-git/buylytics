@@ -1,0 +1,22 @@
+# Kept out of the build context.
+#
+# node_modules is the important one: it is ~400 MB, `npm ci` recreates it inside
+# the image anyway, and copying a host node_modules built on macOS into a Linux
+# image installs the wrong platform binaries — @rollup/rollup-darwin-arm64 where
+# @rollup/rollup-linux-* is needed — which fails the build in a confusing way.
+node_modules/
+
+# The previous build's output. Copying it in would let a stale dist sit next to the
+# fresh one, and the image takes dist from the build stage regardless.
+dist/
+
+.git/
+.gitignore
+*.log
+.DS_Store
+.eslintcache
+
+# Note: .env is NOT excluded. Vite needs it at build time and it holds only
+# publishable VITE_ values by design — the Clerk *publishable* key and display
+# preferences. Secrets belong in backend/.env, which the backend image does
+# exclude.

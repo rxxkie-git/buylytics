@@ -1,0 +1,75 @@
+# Runtime dependencies.
+#
+#     pip install -r requirements.txt
+#
+# Test and development tooling lives in requirements-dev.txt, which installs this
+# file too. Every third-party module imported under app/ appears here, and
+# tests/check_dependencies.py fails if that stops being true — eight imports had
+# drifted out of this file before that check existed, including the two the Phase 2
+# infrastructure depends on.
+
+# --- Web layer -------------------------------------------------------------
+fastapi>=0.135.3,<1.0.0
+uvicorn[standard]>=0.43.0,<1.0.0
+python-multipart>=0.0.22,<1.0.0
+
+# FastAPI depends on both of these, so they are installed either way. They are
+# named here because app/ imports them *directly* — pydantic in app/auth.py and
+# app/routes/inventory.py, starlette in app/core/errors.py and
+# app/core/middleware.py — and code should declare what it imports rather than
+# inherit it from a parent's dependency tree that a future release may prune.
+#
+# starlette carries no upper bound on purpose: FastAPI pins it to a narrow window
+# already, and a second upper bound here would only create resolver conflicts on
+# FastAPI upgrades without adding protection.
+pydantic>=2.7.0,<3.0.0
+starlette>=0.40.0
+
+# Starlette's own concurrency layer, imported directly by app/core/concurrency.py
+# for CapacityLimiter and to_thread.run_sync. Same reasoning as above: the module
+# that imports it declares it.
+#
+# to_thread.run_sync's `abandon_on_cancel` parameter is what pins the floor at
+# 4.2 — it was named `cancellable` before that, and the old spelling was removed
+# in 5.0, so calling it by the new name against an older anyio raises TypeError
+# at the first import request rather than at startup.
+anyio>=4.2.0,<5.0.0
+
+# --- Data and persistence --------------------------------------------------
+SQLAlchemy>=2.0.0,<3.0.0
+psycopg[binary]>=3.1.0,<4.0.0
+alembic>=1.13.0,<2.0.0
+
+# --- Analytics and ML ------------------------------------------------------
+pandas>=2.3.3,<3.0.0
+numpy>=2.3.5,<3.0.0
+scikit-learn>=1.8.0,<2.0.0
+joblib>=1.5.3,<2.0.0
+openpyxl>=3.1.5,<4.0.0
+
+# --- Auth and transport ----------------------------------------------------
+PyJWT>=2.8.0,<3.0.0
+cryptography>=42.0.0,<44.0.0
+httpx>=0.27.0,<1.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# --- Feature-gated ---------------------------------------------------------
+# The app starts and serves traffic without these three. Each is imported lazily
+# inside a guarded block, so absence degrades one feature instead of breaking
+# startup. They are installed by default anyway, because the alternative is an
+# operator setting REDIS_ENABLED=true, reading "install requirements or set
+# REDIS_ENABLED=false" in the log, running exactly that, and hitting the same
+# error again.
+#
+# Drop them for a lean deployment only with the trade-off in hand:
+#
+#   redis        REDIS_ENABLED=true fails to connect; every read falls back to
+#                PostgreSQL, which is correct but slower.
+#   aiokafka     KAFKA_ENABLED=true fails to start the producer; events are not
+#                published and consumers never run.
+#   statsmodels  the ARIMA forecast in app/services/product_analysis.py returns
+#                None and the demand-forecast section of Product Analysis is
+#                simply absent. It is not replaced with an estimate.
+redis>=5.0.0,<7.0.0
+aiokafka>=0.10.0,<1.0.0
+statsmodels>=0.14.0,<1.0.0

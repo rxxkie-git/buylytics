@@ -1,0 +1,27 @@
+# Test and development dependencies.
+#
+#     pip install -r requirements-dev.txt
+#
+# Installs the runtime set as well, so this is the single command for a working
+# checkout. Kept separate from requirements.txt because none of it should ship to
+# a production image.
+-r requirements.txt
+
+# The four Phase 1 suites (tests/test_ingestion.py, test_models.py,
+# test_repo_crud.py, test_repositories.py) are pytest modules.
+#
+# No async plugin is needed. The Phase 2 checks that exercise async code —
+# tests/check_event_handlers.py and tests/test_cache_isolation.py — drive the loop
+# with asyncio.run() themselves rather than relying on pytest-asyncio, which is
+# part of why they are written to run as plain scripts too.
+pytest>=8.0.0,<9.0.0
+
+# tests/test_compose.py parses docker-compose.yml to assert the Kafka and Redis
+# service definitions match what app/config.py defaults expect.
+PyYAML>=6.0,<7.0
+
+# upload_sample.py and upload_product_test.py, two by-hand scripts at the backend
+# root that POST a CSV at a locally running server. Not imported by app/ or by any
+# test; they are kept because they are the quickest way to smoke-test an upload
+# endpoint against a real process.
+requests>=2.31.0,<3.0.0

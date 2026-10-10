@@ -1,0 +1,7 @@
+customer_id,customer_name,city,recency,frequency,monetary,total_orders,avg_order_value,preferred_channel,last_purchase_date
+C001,Alice,Bengaluru,12,8,4200,10,420,Website,2026-03-24
+C002,Bob,Hyderabad,48,3,900,4,225,Mobile App,2026-02-17
+C003,Charlie,Chennai,75,2,520,3,173,Marketplace,2026-01-21
+C004,Deepa,Mumbai,20,6,2600,7,371,Retail Store,2026-03-16
+C005,Eswar,Pune,34,4,1500,5,300,Website,2026-03-02
+C006,Farah,Delhi,9,9,5100,11,464,Mobile App,2026-03-27

@@ -1,0 +1,38 @@
+# Kept out of the build context.
+#
+# The first entry is the important one: backend/.env holds the Supabase password,
+# the Clerk secret key and the webhook secret. Compose passes those in as runtime
+# environment variables, so the file has no reason to be inside an image — and an
+# image layer is not a secret store. Anyone who can pull the image can read it.
+
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+env/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Written at runtime by app/main.py; a stale copy from a developer's machine would
+# shadow it.
+preprocessing_outputs/
+
+# Tests run on the host, not in the image. Excluding them keeps the image to what
+# actually serves traffic.
+tests/
+
+# Ad-hoc scripts left in the tree, none of them imported by the app.
+t_webhooks.py
+upload_product_test.py
+upload_sample.py
+sample_upload.csv
+
+*.log
+.DS_Store

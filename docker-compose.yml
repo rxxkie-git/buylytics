@@ -1,0 +1,428 @@
+# The whole application: frontend, backend, Redis, Kafka.
+#
+#   docker compose up --build
+#
+# Then open http://localhost:3000. The API is on http://localhost:8000 for direct
+# inspection, and the frontend also proxies to it, so the browser only ever talks
+# to one origin.
+#
+# What is deliberately NOT here
+# -----------------------------
+# PostgreSQL. The database is Supabase, a managed service and the source of truth
+# for every tenant's data. Running a second Postgres in a container would create a
+# convincing-looking database that shares no data with the real one, and the first
+# person to migrate against the wrong DATABASE_URL would have a bad afternoon.
+# DATABASE_URL is read from backend/.env and points at Supabase from inside the
+# container exactly as it does from the host.
+#
+# Container-to-container addressing
+# ---------------------------------
+# Services reach each other by service name: the backend uses `redis:6379` and
+# `kafka:9092`. Never localhost — inside a container that means the container
+# itself, so `redis://localhost:6379` from the backend is a connection to nothing.
+# The published ports below are for the host only.
+#
+# Prerequisite
+# ------------
+# backend/.env must exist; it carries DATABASE_URL, the Clerk keys and the webhook
+# secret. `cp backend/.env.example backend/.env` and fill it in. Nothing secret is
+# written in this file, and no secret is baked into an image — see the two
+# .dockerignore files.
+#
+# Common operations
+#
+#   docker compose up --build              # build and start everything
+#   docker compose up -d redis kafka       # infrastructure only, app on the host
+#                                          # (backend/.env works as-is: Redis and
+#                                          #  Kafka are published on their usual
+#                                          #  localhost ports)
+#   docker compose logs -f backend         # follow the API
+#   docker compose run --rm backend alembic upgrade head
+#   docker compose down                    # stop, keep data
+#   docker compose down -v                 # stop, discard the Redis volume
+#
+# Redis and Kafka remain optional to the application: with REDIS_ENABLED=false and
+# KAFKA_ENABLED=false the backend serves the whole API from PostgreSQL and runs
+# analytics jobs inline. They are enabled here because exercising the asynchronous
+# paths is the point of having them.
+
+name: cbpa-dev
+
+services:
+  # -------------------------------------------------------------------------
+  # Kafka in KRaft mode — no Zookeeper.
+  #
+  # A single node acting as both controller and broker. Since Kafka 3.3 KRaft is
+  # production-ready and removes the second system that used to have to be
+  # running, understood and debugged before a message could move.
+  # -------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: cbpa-kafka
+    # Pinned so the broker's own idea of its hostname is the name other containers
+    # reach it by. Without this the container's hostname is its generated id, and
+    # any address Kafka derives from it is unresolvable from another container.
+    hostname: kafka
+    restart: unless-stopped
+    ports:
+      # Bound to loopback deliberately: an unauthenticated broker on 0.0.0.0 is
+      # reachable by anything else on the network.
+      #
+      # Host 9092 -> container 19092, and the mismatch is the point. Inside the
+      # container 9092 belongs to the DOCKER listener, so the HOST listener has to
+      # bind something else — two listeners cannot share a port. Publishing it back
+      # on 9092 keeps the host-facing address the one backend/.env.example already
+      # documents, so a backend run with `uvicorn` against these containers needs no
+      # configuration change. Kafka then advertises HOST as localhost:9092, which is
+      # the address that actually works from out here.
+      - "127.0.0.1:9092:19092"
+    environment:
+      # --- KRaft identity -------------------------------------------------
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- Listeners ------------------------------------------------------
+      # Two listeners because a client inside the Docker network and a client on
+      # the host resolve the broker differently. Kafka's bootstrap response tells
+      # the client which address to use for subsequent connections, so getting
+      # this wrong produces the classic symptom: bootstrap succeeds, then every
+      # produce times out against an unreachable advertised host.
+      #
+      # The backend runs in a container and connects on the DOCKER listener:
+      # KAFKA_BOOTSTRAP_SERVERS=kafka:9092. The HOST listener binds 19092 inside the
+      # container but is advertised as localhost:9092, because that is where the port
+      # publication above puts it — advertised addresses describe the client's view,
+      # not the broker's. A backend started on the host with `uvicorn` therefore uses
+      # localhost:9092, unchanged. Advertising only one of the two listeners would
+      # break whichever client is not it.
+      #
+      # No entry below is 0.0.0.0, and that is the fix for a real startup failure:
+      #
+      #   advertised.listeners cannot use the nonroutable meta-address 0.0.0.0.
+      #   Use a routable IP address.
+      #
+      # Kafka refuses to *advertise* the wildcard, because "connect to 0.0.0.0" is
+      # not an instruction a client can follow. It is legal to *bind* to it, and
+      # advertised.listeners was already explicit here — but when Kafka has to
+      # derive an advertised endpoint it falls back to `listeners`, and every entry
+      # there was 0.0.0.0, so the derived value tripped that check. Writing the
+      # host as empty (`DOCKER://:9092`) binds to the wildcard exactly as before —
+      # Kafka documents an empty host as "bind to all interfaces" — while leaving
+      # no meta-address for any code path to pick up. Combined with `hostname:
+      # kafka` below, anything Kafka derives from the host's own name is `kafka`,
+      # which is routable on this network.
+      KAFKA_LISTENERS: DOCKER://:9092,HOST://:19092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: DOCKER://kafka:9092,HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: DOCKER:PLAINTEXT,HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+
+      # --- Single-node sizing ---------------------------------------------
+      # Every default below assumes a three-broker cluster. On one node an
+      # unadjusted replication factor of 3 makes the internal consumer-offsets
+      # topic uncreatable, and consumer groups fail to commit with an error that
+      # does not obviously point here.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      # Zero rebalance delay: with one consumer, waiting three seconds on every
+      # startup is pure latency during development.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # The application creates its own topics with explicit configuration, but
+      # auto-creation stays on so a typo in a topic name during exploration does
+      # not look like a broker fault.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+
+      # A week of retention locally. Events are replayable within that window,
+      # which is what makes "reset the consumer group and reprocess" possible.
+      KAFKA_LOG_RETENTION_HOURS: 168
+
+      CLUSTER_ID: cbpa-local-cluster-01
+
+    # No volume for the Kafka log, on purpose.
+    #
+    # Kafka holds no authoritative data here — it is the event bus, and everything
+    # that matters is also written to PostgreSQL (webhook deliveries, the processed
+    # event ledger, job records). So the log is a buffer, not a copy of record, and
+    # losing it when the container is recreated costs nothing. It survives `stop`
+    # and `start` in the container's own writable layer, which covers the case that
+    # actually comes up day to day.
+    #
+    # The alternative — a named volume at /var/lib/kafka/data — is where this
+    # usually goes wrong: that path does not exist in the image, so Docker creates
+    # it root-owned, the broker runs as an unprivileged user, and startup dies with
+    # a permission error on the log directory that reads like a Kafka bug.
+    healthcheck:
+      # Asks the broker to list topics over the DOCKER listener. A TCP port check
+      # would pass while the broker was still forming its quorum and rejecting
+      # every request, which is precisely the window a dependent service must
+      # wait through.
+      #
+      # `kafka:9092` and not `localhost:...`: this is the container resolving its own
+      # pinned hostname, so the address the broker advertises back for that listener
+      # is the same one the check dialled. Bootstrapping on the HOST listener instead
+      # would get localhost:9092 in reply — correct out on the host, but inside the
+      # container that port is the DOCKER listener, and a check that only works by
+      # coincidence is worse than no check.
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list > /dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # Redis — cache only.
+  #
+  # Nothing here is the sole copy of anything. Every cached value can be
+  # recomputed from PostgreSQL, which is why `docker compose down -v` is safe and
+  # why persistence is configured for convenience rather than durability.
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: cbpa-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      # A cache needs a ceiling. Without one, Redis grows until the host starts
+      # swapping and the "fast path" becomes the slow one. `allkeys-lru` evicts
+      # the least recently used key on pressure, which is correct for a cache and
+      # would be data loss for a database.
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # -------------------------------------------------------------------------
+  # One-shot topic creation.
+  #
+  # Runs after Kafka is healthy, creates the six topics with explicit partition
+  # and retention settings, then exits. Auto-creation would make them too, but
+  # with defaults — and the DLQ in particular wants long retention, because the
+  # whole point of a dead-letter topic is that a human looks at it later.
+  #
+  # Part of `up` rather than behind a profile, and the backend waits for it to
+  # exit successfully. That ordering is deliberate: if the broker auto-creates a
+  # topic first, `--create --if-not-exists` is a no-op and the retention settings
+  # below never get applied. The cost is that a genuine failure here blocks the
+  # API from starting — which is the right trade, because the alternative is
+  # silently running on default retention.
+  # -------------------------------------------------------------------------
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: cbpa-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        BROKER=kafka:9092
+        create () {
+          echo "  topic: $$1 (partitions $$2, retention $$3 ms)"
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$$BROKER" \
+            --create --if-not-exists --topic "$$1" \
+            --partitions "$$2" --replication-factor 1 \
+            --config retention.ms="$$3"
+        }
+
+        echo "Creating CBPA topics on $$BROKER"
+
+        # Partition counts reflect expected parallelism, and every event is keyed
+        # by business_id — so one tenant's events always land on one partition and
+        # stay in order relative to each other.
+        create raw.imports        3 604800000
+        create customers.events   3 604800000
+        create orders.events      3 604800000
+        create inventory.events   3 604800000
+        create analytics.jobs     3 604800000
+
+        # Thirty days. A poison message discovered on a Monday is still there when
+        # someone gets to it.
+        create events.dlq         1 2592000000
+
+        echo
+        echo "Topics now on the broker:"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server "$$BROKER" --list
+
+  # -------------------------------------------------------------------------
+  # FastAPI backend.
+  #
+  # Connects out to Supabase over the internet and in to Redis and Kafka by
+  # service name. The image contains no configuration: everything comes from
+  # backend/.env plus the four Docker-network values below.
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: cbpa-backend:local
+    container_name: cbpa-backend
+    restart: unless-stopped
+
+    # DATABASE_URL, CLERK_SECRET_KEY, CLERK_ISSUER, WEBHOOK_SECRET and the rest
+    # come from here. Compose reads the file at runtime and passes the values as
+    # environment variables — they are never copied into the image, which is why
+    # backend/.dockerignore excludes it.
+    #
+    # This file must exist. `cp backend/.env.example backend/.env` first; an
+    # up-front "env file not found" is better than a container that starts and
+    # then cannot reach a database.
+    env_file:
+      - ./backend/.env
+
+    # Only the values that are *facts about the network*, so they win over
+    # anything in backend/.env — which is written for running on the host, where
+    # localhost is correct and here would mean this container.
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
+      KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+
+    ports:
+      # Loopback only. The frontend container reaches the API over the compose
+      # network and does not need this; it is published so `curl
+      # localhost:8000/health` works and so a host-run `npm run dev` can proxy to
+      # it during development.
+      - "127.0.0.1:8000:8000"
+
+    volumes:
+      - ./backend/app:/app/app
+
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # Event worker.
+  #
+  # Consumes raw.imports, customers.events, orders.events, inventory.events and
+  # analytics.jobs, and runs the handlers in app/events/handlers/ — cache
+  # invalidation after an import, and the RFM/segmentation refresh.
+  #
+  # Why this service has to exist
+  # -----------------------------
+  # With KAFKA_ENABLED=true (the default above) the API publishes to the broker
+  # and returns. Without a consumer those events sat unread in the topics: an
+  # import wrote every row and then nothing dropped the tenant's cached
+  # dashboard reads and nothing recomputed RFM, so a successful import looked
+  # like it had done nothing until the cache TTL expired. The handlers and this
+  # entrypoint were both already written; only the container was missing.
+  #
+  # Same image, same code, same database — a modular-monolith worker, not a
+  # second service to keep in sync. `python -m app.events.worker` exits 0 when
+  # KAFKA_ENABLED=false, hence `restart: on-failure` rather than
+  # `unless-stopped`: with Kafka off, the API dispatches inline and this
+  # container is correctly a no-op instead of a restart loop.
+  # -------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: cbpa-backend:local
+    container_name: cbpa-worker
+    restart: on-failure
+
+    command: ["python", "-m", "app.events.worker"]
+
+    env_file:
+      - ./backend/.env
+
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
+      KAFKA_ENABLED: ${KAFKA_ENABLED:-true}
+
+    volumes:
+      - ./backend/app:/app/app
+
+
+    # No ports. The worker serves no HTTP and must not be reachable.
+
+    # The image's HEALTHCHECK (backend/Dockerfile:57) opens
+    # http://127.0.0.1:8000/health. This container runs a Kafka consumer, not
+    # uvicorn, so that probe can never succeed and `docker compose ps` would show
+    # cbpa-worker as `unhealthy` forever — a fault indicator pointing at a
+    # container that is working correctly. Nothing depends_on this service's
+    # health, so disabling is honest rather than permissive: liveness here is
+    # "the process is still consuming", which `restart: on-failure` already
+    # covers, and inventing an HTTP port on the worker just to answer a probe
+    # would add a listener whose only purpose is to be checked.
+    healthcheck:
+      disable: true
+
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # React frontend, built and served by nginx.
+  #
+  # nginx also proxies /api, /health and /product-analysis to the backend, so the
+  # browser makes same-origin requests, there is no CORS preflight, and no API
+  # hostname is compiled into the JavaScript.
+  # -------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # Vite inlines these at build time, so they are baked into the image rather
+      # than read at startup — changing one needs a rebuild, not a restart. Empty
+      # defaults keep `up --build` working with no setup: the Dockerfile drops
+      # empty values so frontend/.env still supplies them.
+      #
+      # Leave VITE_API_BASE_URL empty. The client then issues relative requests
+      # that nginx resolves; a value here would compile one machine's address into
+      # a bundle served to every browser.
+      args:
+        VITE_CLERK_PUBLISHABLE_KEY: ${VITE_CLERK_PUBLISHABLE_KEY:-}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+        VITE_CURRENCY: ${VITE_CURRENCY:-}
+        VITE_LOCALE: ${VITE_LOCALE:-}
+    image: cbpa-frontend:local
+    container_name: cbpa-frontend
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:3000:80"
+
+    depends_on:
+      # Started, not healthy. nginx re-resolves the backend hostname per request,
+      # so the page can load and report an API error rather than the whole site
+      # being unavailable while the API warms up.
+      backend:
+        condition: service_started
+
+volumes:
+  # Only Redis. The official image creates and owns /data, so a named volume here
+  # mounts cleanly — unlike the Kafka case described above.
+  redis-data:
